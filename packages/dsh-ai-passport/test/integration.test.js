@@ -53,6 +53,27 @@ function sentByHost(runtime) {
   return runtime.link.transport.received.map((entry) => entry.message)
 }
 
+/**
+ * 等设备**真的**收到满足条件的那条 `task.state`，返回它。
+ *
+ * 为什么不能"发完 sleep 一下就断言"：主机的发送要经过链路队列异步落地，
+ * 固定 sleep 是在跟投递赛跑 —— 这个用例第一版就栽在这里（睡 20ms 时那条
+ * 状态还在队列里，断言看到的是上一条 idle，报了一个假失败）。
+ * 轮询等待既快又稳：条件一旦成立立刻返回，超时才报错并附上最后一条实际内容。
+ */
+async function waitForDeviceTaskState(runtime, predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs
+  let last
+  for (;;) {
+    last = sentByHost(runtime).filter((message) => message.type === MSG.TASK_STATE).at(-1)
+    if (last && predicate(last)) return last
+    if (Date.now() >= deadline) {
+      throw new Error(`等待设备收到预期的 task.state 超时，最后一条：${JSON.stringify(last)}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
 /** 触发某个已注册的协议处理器，模拟"设备发来一条消息"。 */
 async function invokeHandler(runtime, type, payload) {
   const handler = runtime.link.handlers.get(type)
@@ -160,6 +181,40 @@ test('状态：同一状态不重复推送（避免设备反复响提示音）',
   for (let i = 0; i < 5; i += 1) state.push()
   runtime.link.send = original
   assert.equal(sent.length, 0, '状态未变化时不应重复推送')
+  await teardown({ runtime })
+})
+
+test('状态：并发任务数变化必须重新下发（设备不能停在"1 个任务执行中"）', async () => {
+  // 真机反馈：同时开两个任务，设备上一直显示"1 个任务执行中"。
+  // 根因是主机按**状态**去重，而「运行中」的标题里写着计数 —— 状态没变、
+  // 标题变了，第二个任务的推送就被吞掉了。
+  const { host, runtime } = await setupRuntime()
+  const { state } = runtime.domains
+  state.onLinkReady()
+
+  host.addSession({ id: 'session-m1', title: '重构登录模块' })
+  host.addSession({ id: 'session-m2', title: '修复导出乱码' })
+
+  host.startTurn('session-m1')
+  const first = await waitForDeviceTaskState(runtime, (message) => message.title === '1 个任务执行中')
+  assert.ok(first, '第一个任务开始时设备应显示 1')
+
+  host.startTurn('session-m2')
+  await waitForDeviceTaskState(runtime, (message) => message.title === '2 个任务执行中')
+  assert.equal(state.snapshot().runningCount, 2, '主机侧必须知道有两个任务在跑')
+
+  // 结束其中一个：状态仍是 running，但计数必须回落 —— 否则设备会一直显示 2
+  host.endTurn('session-m1', { kind: 'completed' })
+  const remaining = await waitForDeviceTaskState(runtime, (message) => message.title === '1 个任务执行中')
+  assert.equal(remaining.state, TASK_STATE.RUNNING, '还有一个任务在跑，状态仍是运行中')
+
+  // 全部结束：回到「已完成」并带上刚结束的任务标题
+  host.endTurn('session-m2', { kind: 'completed' })
+  const done = await waitForDeviceTaskState(
+    runtime,
+    (message) => message.state === TASK_STATE.COMPLETED && /修复导出乱码/.test(message.title ?? ''),
+  )
+  assert.ok(done, '全部结束后设备应显示已完成 + 刚结束的任务标题')
   await teardown({ runtime })
 })
 

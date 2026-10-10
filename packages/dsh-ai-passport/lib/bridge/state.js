@@ -26,9 +26,15 @@
  *  「已完成」只在结束后停留几秒，然后回到空闲 —— 否则设备会永远显示"已完成"，
  *  那个状态就失去了"刚刚发生"的含义。
  *
- *  设计取舍：**只在状态真正变化时推送**。设备屏幕小、BLE 带宽有限，
- *  而且设备端是靠"状态变化"来决定是否响提示音的 —— 重复推送同一状态
- *  会让设备反复响铃，用户很快就会把提示音关掉。
+ *  设计取舍：**只在「状态 + 标题」变化时推送**。设备屏幕小、BLE 带宽有限，
+ *  而完全相同的重复推送没有信息量。
+ *
+ *  ★ 去重键必须**同时包含状态与标题**，不能只看状态（真机反馈的返工点）：
+ *    「运行中」的标题里写着"几个任务在执行"，状态却一直是 running。
+ *    若只按状态去重，第二个任务开始时的"2 个任务执行中"就永远发不出去，
+ *    设备会一直停在"1 个任务执行中"—— 表现为"同时开两个任务，设备只说一个在跑"。
+ *    设备端只在状态**真的变化**时响提示音（固件 app.c handle_task_state 的
+ *    changed 判断），所以标题变化触发的重推不会让设备反复响铃。
  */
 
 import { MSG, TASK_STATE } from '../protocol/constants.js'
@@ -55,7 +61,12 @@ export class StateDomain {
     /** 「已完成」状态的到期时间戳。 */
     this.completedUntil = 0
     this.completedTimer = null
-    /** 最近一次推送出去的状态，用于去重。 */
+    /**
+     * 最近一次推送出去的「状态 + 标题」去重键（见 #dedupKey），null = 还没推过。
+     *
+     * ★ 不能只存状态：运行中的计数写在标题里，只按状态去重会把计数冻结在
+     *   第一个任务上（真机反馈"两个任务只显示一个在跑"）。
+     */
     this.lastSent = null
     /**
      * ★ 设备是否正在录音（PTT 按住说话）。
@@ -253,6 +264,20 @@ export class StateDomain {
   }
 
   /**
+   * 去重键：状态 + 标题。
+   *
+   * 为什么标题也进键：`running` 的标题是"N 个任务执行中"，`completed` 的标题是
+   * 刚结束的任务名 —— 同一个状态下这两样都会变，而它们正是用户要看的信息。
+   * 只比状态就会把这些更新全部吞掉。
+   *
+   * 分隔符用 NUL：标题是给人看的文本，不会含 NUL，因此 `a + NUL + b` 不会
+   * 把两个不同的组合撞成同一个键（用 '|' 之类可打印字符就有撞键的理论风险）。
+   */
+  #dedupKey(state, title) {
+    return `${state}\u0000${title}`
+  }
+
+  /**
    * 把当前状态下发给设备。
    *
    * @param {{force?: boolean}} [options] force=true 时跳过去重（链路刚建立时用）
@@ -263,8 +288,9 @@ export class StateDomain {
     if (this.deviceRecording) return
     if (this.link.snapshot().state !== 'connected') return
     const { state, title } = this.current()
-    if (!options.force && state === this.lastSent) return
-    this.lastSent = state
+    const key = this.#dedupKey(state, title)
+    if (!options.force && key === this.lastSent) return
+    this.lastSent = key
     // 同步给面板快照：面板与设备显示的必须是**同一个**状态，
     // 否则用户在两边看到不一致时会怀疑哪边是真的。
     if (this.domainState) this.domainState.taskState = { state, title, at: Date.now() }
