@@ -27,6 +27,70 @@ window.__ModuleLoader__.load({
     /** 面板接口前缀，与宿主半区 `lib/panel/index.js` 注册的路径一致。 */
     const API = '/dsh-passport'
 
+    /** DSH 内置 webserver 的默认回环地址：只有在拿不到页面自身 origin 时才用它兜底。 */
+    const FALLBACK_ORIGIN = 'http://127.0.0.1:19387'
+
+    /** apply() 拿到的客户端 ctx，供挂件内的动作调用宿主服务（打开面板）。 */
+    let clientCtx = null
+
+    /**
+     * 面板的绝对地址。右侧栏浏览器页签是独立文档，必须给绝对 URL。
+     * 页面自身是 http(s) 时直接用它的 origin；桌面端页面若是自定义协议
+     * （dsh-app://），则退回 DSH webserver 的默认回环地址。
+     */
+    function panelUrl() {
+      try {
+        const loc = window.location
+        if (loc && (loc.protocol === 'http:' || loc.protocol === 'https:')) return `${loc.origin}${API}`
+      } catch {
+        // 没有 window.location 的环境（理论上不会发生）
+      }
+      return `${FALLBACK_ORIGIN}${API}`
+    }
+
+    /**
+     * 打开控制面板。
+     *
+     * ★ 为什么不能只写一句 `window.open`（真机实测：点了没反应）：
+     *   DSH 桌面端主进程里的 window-open 处理是
+     *     `setWindowOpenHandler(() => ({ action: 'deny' }))`，
+     *   并且只把 **https:** 的链接交给系统浏览器（shell.openExternal），其余一律拒绝；
+     *   而本面板是 http://127.0.0.1:19387/dsh-passport —— 于是要么被静默拒绝，
+     *   要么被塞进嵌入式浏览器（访客视图）后加载失败：
+     *     Desktop browser operation failed … GUEST_VIEW_MANAGER_CALL: ERR_FAILED
+     *   两种结局在界面上都是"点了没效果"。
+     *
+     *   DSH 自己打开外链走的是**右侧栏浏览器页签**：
+     *     ctx.get('sidebarRightTabs')?.get('browser') !== undefined
+     *       → ctx.sidebarRight.openTab('browser', { params: { url } })
+     *   这里照抄这条路径（服务名/属性两条访问方式都试），失败才退回 window.open
+     *   （在浏览器里访问 DSH Web UI 时 window.open 是正常的）。
+     *
+     * @returns {'sidebar'|'window'} 实际走通的路径，便于调用方决定要不要提示手动地址
+     */
+    function openPanel() {
+      const url = panelUrl()
+      try {
+        const ctx = clientCtx
+        const pick = (name) => (typeof ctx?.get === 'function' ? ctx.get(name) : null) ?? ctx?.[name] ?? null
+        const tabs = pick('sidebarRightTabs')
+        const sidebar = pick('sidebarRight')
+        const browserAvailable = tabs && typeof tabs.get === 'function' && tabs.get('browser') !== undefined
+        if (browserAvailable && typeof sidebar?.openTab === 'function') {
+          sidebar.openTab('browser', { params: { url } })
+          return 'sidebar'
+        }
+      } catch (error) {
+        console.info('[dsh-ai-passport] 右侧栏浏览器页签不可用：', error?.message ?? error)
+      }
+      try {
+        window.open(url, '_blank', 'noopener')
+      } catch (error) {
+        console.info('[dsh-ai-passport] window.open 失败：', error?.message ?? error)
+      }
+      return 'window'
+    }
+
     const NS = 'aiPassport'
     /** 挂件自己的样式；用 CSS 变量取主题色，深浅色模式都能跟随。 */
     const CSS = `
@@ -210,8 +274,9 @@ window.__ModuleLoader__.load({
 
     /** 挂件主体。 */
     function PassportWidget(props) {
-      // inputActions 由 conversation.input.activity 槽位的宿主（ui-conversation）提供，
-      // 这是官方语音输入插件用的同一套动词：captureInsertion / insertText / setDraft / submit。
+      // inputActions 来自 composer bar 那套 standardProps
+      // （conversation.input.right / .left 与 activity 槽位都给）：
+      // 就是官方语音输入插件用的同一套动词：captureInsertion / insertText / setDraft / submit。
       const inputActions = props?.inputActions
       // useInput 是标准 props 里的 InputState 选择器；读它是为了发送前拿到当前草稿
       // （双击发送会整段替换草稿，旧草稿要带回 host 存档，见 docs/06 §2.3）。
@@ -545,6 +610,28 @@ window.__ModuleLoader__.load({
                 ),
                 speechView.hint ? h('div', { className: 'ap-err' }, speechView.hint) : null,
               ),
+
+              h(
+                'div',
+                { className: 'ap-sect' },
+                h(
+                  'button',
+                  {
+                    className: 'ap-btn primary',
+                    type: 'button',
+                    // 优先走右侧栏浏览器页签（DSH 自己的打开方式），见 openPanel()
+                    onClick: () => openPanel(),
+                  },
+                  '打开控制面板',
+                ),
+                // 桌面端的嵌入式浏览器对 http 回环地址可能拒绝或加载失败，
+                // 所以把地址直接摆在按钮下面：真打不开时复制到浏览器即可用。
+                h(
+                  'div',
+                  { className: 'ap-muted', style: { marginTop: 6, fontSize: 10, wordBreak: 'break-all' } },
+                  panelUrl(),
+                ),
+              ),
             )
           : null,
       )
@@ -553,13 +640,45 @@ window.__ModuleLoader__.load({
     /** 硬依赖：只有槽位注册表。locale 用 DSH 的默认语言即可，不额外注册字典。 */
     const inject = ['slots']
 
+    /**
+     * 挂件落位：`conversation.input.right`（kind: **list**，scope: session）。
+     *
+     * ★ 这个槽位换过一次，原因值得留档（真机排查：挂件"能加载但永远不显示"）：
+     *
+     *   原来注册的是 `conversation.input.activity`。DSH 的槽位契约里它是 **single**：
+     *   整个槽位只能有一个控件，座位就是"模型选择器之后、发送按钮之前"那一个，
+     *   而它已经被官方语音输入占着
+     *   （occupants: experimental-client-ui-voice-input VoiceInput，
+     *     契约里直接标了 replaceRisk: "shadows-shipped-ui"）。
+     *
+     *   单槽位的渲染规则是 `entriesOfSlot(key)[0]`，而 entries 按 priority **升序**排列
+     *   （`(a.priority ?? 0) - (b.priority ?? 0)`）——也就是**优先级最低者渲染**。
+     *   于是注册到那里只有三种结局：
+     *     · priority 0（默认，也就是原代码）→ 与官方注册撞车，DSH 直接报
+     *       “single slot ... already has a registration at priority 0 (registered by registerUi)”，
+     *       本插件整页同步失败，挂件根本不渲染；
+     *     · priority 正数 → 不报错了，但排序排在官方之后，挂件**永远不渲染**
+     *       （曾经误改成 10，症状就是"插件在列表里，输入框旁边什么都没有"）；
+     *     · priority 负数 → 活下来了，但会把官方语音输入按钮顶掉（遮蔽官方 UI）。
+     *   三条路都不对——因为单槽位本质上就不支持"与官方语音输入并排"。
+     *
+     *   list 槽位则允许多条目共存：要求 `id`（自己的 id = 新增一格），`order` 决定先后，
+     *   契约里 occupants 为空、replaceRisk: "none"，且 standardProps 里同样带
+     *   `inputActions` / `useInput`，语音回填所需的 prop 一个不少。
+     */
+    const SLOT_KEY = 'conversation.input.right'
+
     function apply(ctx) {
+      // 挂件里的动作（打开面板）要调宿主服务，这里把 ctx 存下来给组件用
+      clientCtx = ctx
       ctx.effect(() => {
-        ctx.slots.inject('conversation.input.activity', () =>
+        ctx.slots.inject(SLOT_KEY, () =>
           ctx.slots.register(
             {
-              name: 'conversation.input.activity',
-              // 放在模型选择器之后、提交按钮之前，与官方语音输入并排
+              name: SLOT_KEY,
+              // list 槽位的必填项：用我们自己的 id，才会"新增一格"而不是替换别人那格
+              id: 'dsh-ai-passport',
+              // 同一槽位内的先后（升序）；取 40 让它靠近发送按钮一侧
               order: 40,
               locale: NS,
               inject: () => ({}),

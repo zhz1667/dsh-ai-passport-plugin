@@ -152,17 +152,34 @@ test('导出 apply 与 inject，inject 只声明 slots', async () => {
   assert.deepEqual(exports.inject, ['slots'])
 })
 
-test('apply() 在 conversation.input.activity 槽位注册了挂件', async () => {
+test('apply() 把挂件注册进 list 槽位，且不抢占 single 的 conversation.input.activity', async () => {
   const { slotInjections, calls } = await runClientBundle()
   assert.equal(slotInjections.length, 1)
-  assert.equal(slotInjections[0].key, 'conversation.input.activity')
+
+  // ★ 回归钉子（真机排查换来的，别改回去）：
+  //   conversation.input.activity 是 **single** 槽位，座位被官方语音输入占着
+  //   （occupants: experimental-client-ui-voice-input VoiceInput，
+  //     replaceRisk: "shadows-shipped-ui"）。
+  //   单槽位渲染 entries 按 priority 升序后的 [0]，也就是"优先级最低者渲染"，于是注册到那里：
+  //     priority 0 → 撞车报错、整页同步失败；priority 正数 → 被官方压住永不渲染；
+  //     priority 负数 → 能渲染但顶掉官方按钮。三条路都不通。
+  //   所以必须待在 list 槽位（自己的 id 即新增一格，replaceRisk: none）。
+  assert.notEqual(
+    slotInjections[0].key,
+    'conversation.input.activity',
+    '不要再注册进 single 槽位 conversation.input.activity',
+  )
+  assert.equal(slotInjections[0].key, 'conversation.input.right')
 
   const registration = calls.find((call) => call.kind === 'register')
   assert.ok(registration, '应当注册一个槽位条目')
-  assert.equal(registration.options.name, 'conversation.input.activity')
-  assert.equal(typeof registration.component, 'function', '组件必须是可渲染的 React 组件')
-  // order 决定它在工具行里的位置；显式断言避免以后被误改到奇怪的位置
+  assert.equal(registration.options.name, 'conversation.input.right')
+  // list 槽位的必填项：没有 id 会被 slots.register 直接拒绝
+  assert.equal(registration.options.id, 'dsh-ai-passport', 'list 槽位必须给 id')
   assert.equal(typeof registration.options.order, 'number')
+  // list 槽位不做"抢座位"那套，priority 留空即可
+  assert.equal(registration.options.priority, undefined, 'list 槽位不需要 priority')
+  assert.equal(typeof registration.component, 'function', '组件必须是可渲染的 React 组件')
 })
 
 test('apply() 注册了样式，且样式 effect 返回清理函数（不留孤儿 style 标签）', async () => {
