@@ -151,9 +151,14 @@ export const AUDIO = Object.freeze({
   /** IMA-ADPCM 4:1，16k/16bit/mono 从 32KB/s 压到 8KB/s。 */
   CODEC: 'ima-adpcm',
   BLOCK_ALIGN: 256,
-  /** 单次录音上限（秒）。设备侧同一上限见 app_voice.c。 */
-  MAX_SECONDS: 15,
-  /** 静音自动结束门限（毫秒）。 */
+  /**
+   * 协议允许的录音**硬上限**（秒）——天花板，不是用户实际生效的值。
+   * 必须与固件 `AP_AUDIO_MAX_SECONDS` 相等（parity 测试强制），两端一起改。
+   * 用户实际生效的上限是 `config.voice.maxSeconds`（默认 60，可选 60/120/360），
+   * 由主机通过 `config` 消息下发给设备，设备只存内存态。
+   */
+  MAX_SECONDS: 360,
+  /** 静音自动结束门限（毫秒）。设备侧同一门限见 app_voice.c。 */
   SILENCE_STOP_MS: 1200,
 })
 

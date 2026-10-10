@@ -42,3 +42,7 @@
         voice:
           enabled: true
           language: zh
+          # 单次录音上限（秒）：默认 60，可选 60 / 120 / 360。
+          # 由插件通过 config {maxRecordSeconds} 下发给设备（设备只存内存态，
+          # 每次链路就绪都会重发）；协议硬天花板是 360s。
+          maxSeconds: 60

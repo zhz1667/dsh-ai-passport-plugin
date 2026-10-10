@@ -26,6 +26,25 @@ import { fileURLToPath } from 'node:url'
 /** PTT 最短说话时长（秒）：短于它视为误碰，静默丢弃不进转写。 */
 const MIN_TALK_SECONDS = 0.5
 
+/** 孤儿会话阈值相对"协议允许的最长录音"留下的宽限（毫秒）。 */
+const STALE_SESSION_MARGIN_MS = 5_000
+
+/**
+ * 孤儿会话（voice.end 永远不来的残留会话）的判定阈值。
+ *
+ * ★ 必须**大于协议允许的最长录音**，否则一段正常的长录音会被当成孤儿丢掉：
+ *   这里踩过坑 —— 原先写死 10_000，而协议上限是 15 秒，于是 10~15 秒的录音
+ *   在收到 voice.end 时先被清理掉，再走 `!session` 分支静默丢弃，不报错、
+ *   设备端毫无提示。阈值从协议上限推导后，上限调整时这里自动跟上。
+ *
+ * @param {number} [maxSeconds] 协议允许的最长录音秒数（默认取 AUDIO.MAX_SECONDS）
+ * @param {number} [marginMs] 宽限毫秒
+ * @returns {number} 毫秒
+ */
+export function staleSessionMs(maxSeconds = AUDIO.MAX_SECONDS, marginMs = STALE_SESSION_MARGIN_MS) {
+  return maxSeconds * 1000 + marginMs
+}
+
 /** 插件包根目录（lib/bridge/voice.js → 上两级）。 */
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
@@ -157,6 +176,28 @@ export class VoiceDomain {
     if (ctx) this.ctx = ctx
   }
 
+  /**
+   * 把单次录音上限下发给设备（`config` 消息）。
+   *
+   * ★ 为什么走消息而不是在设备上配：设备端写 NVS 有磨损，而且两边各存一份必然分叉
+   *   （与提示音开关同一个理由，见固件 handle_config 的说明）。设备只保存内存态，
+   *   每次链路就绪都重发一次 —— 设备断电重连后内存态会丢。
+   *
+   * 设备侧收到后会自行夹到 [1, AP_AUDIO_MAX_SECONDS]，所以这里给坏值也不会把设备带偏。
+   *
+   * @returns {Promise<number>} 实际下发的秒数
+   */
+  async pushConfig() {
+    const maxRecordSeconds = Number(this.config.voice?.maxSeconds) || AUDIO.MAX_SECONDS
+    try {
+      await this.link.send(MSG.CONFIG, { maxRecordSeconds })
+      this.logger('info', `[voice] 录音上限已下发：${maxRecordSeconds}s`)
+    } catch (error) {
+      this.logger('warn', `[voice] 录音上限下发失败：${error?.message ?? error}`)
+    }
+    return maxRecordSeconds
+  }
+
   registerProtocolHandlers() {
     // 音频走独立的 data 事件（不是 JSON 消息），单独接线
     this.link.transport.on('data', this.voiceListener)
@@ -230,13 +271,20 @@ export class VoiceDomain {
         //   assembleWav 抛错，设备弹"识别失败"，随后真正的结果才出文字
         //   （真机返工记录的"先失败后出字"）。
         //   会话的音频是边录边发的，正常情况下 voice.end 紧跟最后一片音频到达；
-        //   超过 STALE_SESSION_MS 没等到 voice.end 的会话判定为孤儿，直接丢弃。
-        const STALE_SESSION_MS = 10_000
+        //   超过阈值还没等到 voice.end 的会话判定为孤儿，直接丢弃。
+        //
+        //   ★ 阈值**不能写死一个小于协议上限的数**：原先写死 10_000，而协议允许
+        //     录 15 秒（AUDIO.MAX_SECONDS）—— 于是 10~15 秒的正常录音在收到
+        //     voice.end 时先被当成"陈旧会话"清掉，紧接着走 `!session` 分支
+        //     "无匹配会话，静默丢弃"：不报错、设备上什么都不显示。
+        //     表现就是"录长一点就没反应"，而两端日志看上去都正常。
+        //     现在由 staleSessionMs() 从**实际生效的上限**推导，改配置这里自动跟上。
+        const staleMs = staleSessionMs(this.config.voice?.maxSeconds ?? AUDIO.MAX_SECONDS)
         if (queue && queue.length > 0) {
           const now = Date.now()
-          while (queue.length > 0 && now - queue[0].startedAt > STALE_SESSION_MS) {
+          while (queue.length > 0 && now - queue[0].startedAt > staleMs) {
             const stale = queue.shift()
-            this.logger('debug', `[voice] 丢弃陈旧会话 session=${sessionId}（已等 ${(now - stale.startedAt) / 1000 | 0}s 无 voice.end）`)
+            this.logger('debug', `[voice] 丢弃陈旧会话 session=${sessionId}（已等 ${(now - stale.startedAt) / 1000 | 0}s 无 voice.end，阈值 ${staleMs / 1000 | 0}s）`)
           }
         }
         const session = queue && queue.length > 0 ? queue.shift() : null
@@ -258,6 +306,17 @@ export class VoiceDomain {
         try {
           const wav = assembleWav(session)
           if (!wav) throw new Error('录音为空或丢片过多')
+
+          // 链路丢片伤到过这段音频：已经重同步救回来了，但要留痕——
+          // "录音一长就识别不到内容"这类问题，唯一的现场凭证就是这个计数。
+          if (wav.resyncs > 0) {
+            this.logger(
+              'warn',
+              `[voice] 音频流丢字节，已重同步 ${wav.resyncs} 次、跳过 ${wav.skippedBytes} 字节` +
+              `（约 ${((wav.skippedBytes / 8000) * 1000).toFixed(0)}ms 音频）；` +
+              `链路统计 gaps=${this.link.stats?.gaps ?? '?'} bytesDropped=${this.link.stats?.bytesDropped ?? '?'}`,
+            )
+          }
 
           // 误碰收束：PTT 短于 500ms 的按压不进转写（与参考项目 PTT_MIN_TALK_MS 同值）。
           // 主页确定键现在是"按住说话"，日常误点很常见；让它进转写只会在设备上
@@ -289,7 +348,7 @@ export class VoiceDomain {
 
           // 记进日志供挂件列出（上限 10 条，防止长时间使用后无限增长）
           this.domainState.voiceLog = [
-            { resultId, text, sessionId, at: Date.now(), deviceMaxRms, seqGaps: session.seqGaps },
+            { resultId, text, sessionId, at: Date.now(), deviceMaxRms, seqGaps: session.seqGaps, resyncs: wav.resyncs, skippedBytes: wav.skippedBytes },
             ...(this.domainState.voiceLog ?? []),
           ].slice(0, 10)
           this.broadcast({ type: 'voice.result', resultId, text, sessionId })
@@ -741,11 +800,13 @@ export function assembleWav(session) {
 
   const compressed = Buffer.concat(parts)
   if (compressed.length < 4) return null   // 不足一个 ADPCM 块头
-  const pcm = decodeImaAdpcm(compressed)
+  // 解码带丢字节重同步：音频通道不重传，丢 N 字节会让后续块头全部错位，
+  // 不重同步的话整段会解成饱和噪声（"录音超过约 5 秒就识别不到内容"的根因）。
+  const { pcm, resyncs, skippedBytes } = decodeImaAdpcmDetailed(compressed)
 
   const { sampleRate, bits, channels } = session.format
   const bytes = Buffer.from(encodeWav(pcm, sampleRate, bits, channels))
-  return { bytes, pcmBytes: pcm.length, compressedBytes: compressed.length }
+  return { bytes, pcmBytes: pcm.length, compressedBytes: compressed.length, resyncs, skippedBytes }
 }
 
 /**
@@ -780,22 +841,88 @@ const IMA_STEP_TABLE = [
   458592, 470170, 482119, 494455, 507193, 520351, 533946, 548000,
 ]
 
-/** 解码一整块 ADPCM：前 4 字节是块头（predictor + index + 保留），之后每字节两个采样。 */
-export function decodeImaAdpcm(data) {
-  if (!data || data.length === 0) return Buffer.alloc(0)
+/**
+ * 每块固定 508 字节（4 字节块头 + 504 字节数据），与固件 `app_voice.c` 的
+ * `ADPCM_BLOCK_DATA 504` 对齐。
+ */
+const ADPCM_BLOCK_STRIDE = 508
+/** 单个块的数据字节上限。 */
+const ADPCM_BLOCK_DATA = 504
+/** stepIndex 的合法上界（与 IMA_INDEX_TABLE / IMA_STEP_TABLE 的长度一致）。 */
+const ADPCM_MAX_STEP_INDEX = 88
+
+/**
+ * 块头合法性：保留字节必须是 0，stepIndex 不能越界。
+ * 设备端 `write_block_header()` 写的第 4 字节恒为 0，所以这是个很强的前置校验。
+ */
+function blockHeaderValid(data, offset) {
+  return (
+    offset + 4 <= data.length &&
+    data[offset + 3] === 0 &&
+    data[offset + 2] <= ADPCM_MAX_STEP_INDEX
+  )
+}
+
+/**
+ * 丢字节之后重新对齐：从 from 起向后找第一个"连续 need 个块头都合法"的位置。
+ *
+ * ★ 为什么必须有这一步（真机实测的根因，别删）：
+ *   音频通道按设计**不重传**（实时性优先，见 protocol/chunk.js），而解码器原先假定
+ *   块头严格落在 0 / 508 / 1016… 上。只要中途丢了 N 字节（实测一次丢了 **160 字节**），
+ *   后面所有块头位置全部错位：数据字节被当成块头解，stepIndex 疯跳，PCM 变成饱和噪声。
+ *   症状就是"录音超过约 5 秒就识别不到内容"——长录音才容易撞上丢片，
+ *   而波形的分界点恰好是丢字节那一刻（实测 4.95s 处，之后 RMS 从 3000 飙到 24000）。
+ *   扫描重同步把"整段报废"降级为"丢掉十几毫秒"：实测同一段流重同步后 103 个块全部可解。
+ *
+ *  need=3 是刻意的：随机字节连续三次恰好满足块头条件的概率极低（≈0.4%³），
+ *  所以在干净流上不会误判，也不会把噪声里的巧合当块头。
+ */
+function findBlockSync(data, from, need = 3, limit = 4096) {
+  const max = Math.min(data.length - 4, from + limit)
+  for (let offset = from; offset < max; offset += 1) {
+    let good = 0
+    let cursor = offset
+    while (good < need && blockHeaderValid(data, cursor)) {
+      good += 1
+      cursor += ADPCM_BLOCK_STRIDE
+    }
+    if (good >= need) return offset
+  }
+  return -1
+}
+
+/**
+ * 解码整段 ADPCM（前 4 字节是块头：predictor + stepIndex + 保留；之后每字节两个采样）。
+ *
+ * @param {Buffer} data 按到达顺序拼接的压缩流
+ * @returns {{pcm: Buffer, resyncs: number, skippedBytes: number}}
+ *   resyncs/skippedBytes 供上层判断"这段音频是否被链路丢片伤过"。
+ */
+export function decodeImaAdpcmDetailed(data) {
+  if (!data || data.length === 0) return { pcm: Buffer.alloc(0), resyncs: 0, skippedBytes: 0 }
   const out = Buffer.alloc((data.length - 4) * 4)
   let outIndex = 0
-
   let offset = 0
+  let resyncs = 0
+  let skippedBytes = 0
+
   while (offset + 4 <= data.length) {
+    if (!blockHeaderValid(data, offset)) {
+      const next = findBlockSync(data, offset + 1)
+      if (next < 0) break // 后面全是残片，宁可少解也不解噪声
+      resyncs += 1
+      skippedBytes += next - offset
+      offset = next
+    }
+
     let predictor = data.readInt16LE(offset)
     let stepIndex = data.readUInt8(offset + 2)
     offset += 4
-    if (stepIndex > 88) stepIndex = 88
+    if (stepIndex > ADPCM_MAX_STEP_INDEX) stepIndex = ADPCM_MAX_STEP_INDEX
 
-    // 每块最多 505 字节数据 → 1010 个采样；这里以"本块剩余"为界，
+    // 每块最多 504 字节数据 → 1008 个采样；以"本块剩余"为界，
     // 允许最后一块短一些（设备端的分块边界可能落在任意位置）。
-    const blockEnd = Math.min(data.length, offset + 504)
+    const blockEnd = Math.min(data.length, offset + ADPCM_BLOCK_DATA)
     while (offset < blockEnd) {
       const byte = data[offset]
       offset += 1
@@ -821,7 +948,16 @@ export function decodeImaAdpcm(data) {
       }
     }
   }
-  return out.subarray(0, outIndex)
+  return { pcm: out.subarray(0, outIndex), resyncs, skippedBytes }
+}
+
+/**
+ * 兼容旧签名：只关心 PCM 的调用方继续用它。
+ * @param {Buffer} data 压缩流
+ * @returns {Buffer} PCM
+ */
+export function decodeImaAdpcm(data) {
+  return decodeImaAdpcmDetailed(data).pcm
 }
 
 /** 生成规范的 44 字节 WAV 头。识别提供者会校验它。 */

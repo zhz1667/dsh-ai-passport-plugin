@@ -13,6 +13,15 @@
 /** 传输实现可选值。顺序即面板下拉的推荐顺序。 */
 export const TRANSPORT_KINDS = ['bridge', 'mock', 'noble']
 
+/**
+ * 单次录音上限的可选档位（秒）：默认 60，长口述可用 120 / 360。
+ *
+ * 为什么是**离散档位**而不是任意值：这个上限要下发给设备（`config.maxRecordSeconds`），
+ * 档位固定才能保证"主机配置 ↔ 设备实际行为"始终一致，设置界面也能直接渲染成下拉。
+ * 硬天花板是协议常量 `AUDIO.MAX_SECONDS`（360），不许超过它。
+ */
+export const VOICE_MAX_SECONDS_OPTIONS = [60, 120, 360]
+
 const DEFAULTS = Object.freeze({
   transport: 'bridge',
   targetDeviceId: '',
@@ -32,7 +41,7 @@ const DEFAULTS = Object.freeze({
     fallbackPrompt: true,
     providerId: '',
     language: 'zh',
-    maxSeconds: 15,
+    maxSeconds: 60,
     // 音频归档（用户决策：**默认开启**）：每次成功解码的录音写一组 .wav + .adpcm
     // 到 audioDir（空 = 挂件目录下的 audio/），并按 audioKeepFiles 自动清理最旧的若干组。
     // 上限可控：默认 20 组 ≈ 2.7MB（一组约 108KB wav + 27KB adpcm）。
@@ -87,7 +96,7 @@ export function normalizeConfig(raw) {
       fallbackPrompt: bool(input.voice?.fallbackPrompt, DEFAULTS.voice.fallbackPrompt),
       providerId: str(input.voice?.providerId, DEFAULTS.voice.providerId).trim(),
       language: str(input.voice?.language, DEFAULTS.voice.language) || 'zh',
-      maxSeconds: clamp(int(input.voice?.maxSeconds, DEFAULTS.voice.maxSeconds), 1, 120),
+      maxSeconds: nearestVoiceMaxSeconds(input.voice?.maxSeconds),
       keepAudio: bool(input.voice?.keepAudio, DEFAULTS.voice.keepAudio),
       audioDir: str(input.voice?.audioDir, DEFAULTS.voice.audioDir).trim(),
       audioKeepFiles: clamp(int(input.voice?.audioKeepFiles, DEFAULTS.voice.audioKeepFiles), 1, 500),
@@ -116,6 +125,24 @@ export function normalizeConfig(raw) {
 
 /** 默认值导出，供面板展示"恢复默认"与文档使用。 */
 export const CONFIG_DEFAULTS = DEFAULTS
+
+/**
+ * 把任意输入吸附到最近的合法档位（见 VOICE_MAX_SECONDS_OPTIONS）。
+ *
+ * 非法值、越界值、非数字一律不抛错：配置来自 YAML，写错一个字段不应该让插件起不来。
+ * 例如 -5 / 0 → 60（最小档），9999 → 360（协议天花板），90 → 60（等距取较小档，结果确定）。
+ *
+ * @param {unknown} value 原始输入
+ * @returns {number} 合法档位之一
+ */
+export function nearestVoiceMaxSeconds(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return DEFAULTS.voice.maxSeconds
+  return VOICE_MAX_SECONDS_OPTIONS.reduce(
+    (best, option) => (Math.abs(option - n) < Math.abs(best - n) ? option : best),
+    VOICE_MAX_SECONDS_OPTIONS[0],
+  )
+}
 
 /**
  * 尝试构造 schemastery schema。
@@ -155,7 +182,9 @@ export async function loadConfigSchema() {
           fallbackPrompt: z.boolean().default(true),
           providerId: z.string().default(''),
           language: z.string().default('zh'),
-          maxSeconds: z.natural().min(1).max(120).default(15),
+          maxSeconds: z
+            .union(VOICE_MAX_SECONDS_OPTIONS.map((seconds) => z.const(seconds)))
+            .default(DEFAULTS.voice.maxSeconds),
           keepAudio: z.boolean().default(true),
           audioDir: z.string().default(''),
           audioKeepFiles: z.natural().min(1).max(500).default(20),

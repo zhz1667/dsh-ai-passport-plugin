@@ -14,7 +14,7 @@
  * 蓝牙不可用时插件本身必须照常加载，只是面板上显示"BLE 不可用"。
  */
 
-import { normalizeConfig, loadConfigSchema } from './config.js'
+import { normalizeConfig, loadConfigSchema, nearestVoiceMaxSeconds } from './config.js'
 import { HostLink } from './ble/host-link.js'
 import { MockTransport } from './ble/mock.js'
 import { BridgeProcessTransport } from './ble/bridge-process.js'
@@ -153,6 +153,7 @@ function applyUnsafe(root, rawConfig) {
       subscribe: (listener) => runtime.subscribe(listener),
     })
       panel.start()
+      runtime.attachPanel(panel)
       for (const dispose of panel.registerRoutes(ctx.webServer)) disposers.push(dispose)
       disposers.push(() => panel.dispose())
       logger('info', `[passport] 控制面板已挂载：${PANEL_PATH}`)
@@ -196,6 +197,12 @@ export function createRuntime({ config, logger }) {
   })
 
   const listeners = new Set()
+  /**
+   * 面板实例（未挂载时为 null）。声明放在 broadcast/snapshot 之前的原因：
+   * 域在构造期就可能广播，而广播会调 snapshot() —— 用后声明的 `runtime.panel`
+   * 会在那一步踩到 TDZ。这里用一个早声明的引用把顺序问题彻底消掉。
+   */
+  let panelRef = null
   /** 业务域的最新快照，由各域自己维护。 */
   const domainState = {
     /** 聚合后的整体状态（精简版取代了原来的任务列表）。 */
@@ -293,6 +300,9 @@ export function createRuntime({ config, logger }) {
       // 拦截轨迹：审批/追问的瀑布到底走没走到我们（真机排障用）
       approvalTrace: domainState.approvalTrace ?? [],
       questionsTrace: domainState.questionsTrace ?? [],
+      // 面板访问探针：内嵌浏览器"打开了页签却空白"时，靠它区分
+      // "请求没到面板" / "到了被栅栏拒了" / "文档到了但资源没拿到"。
+      panelAccess: panelRef ? panelRef.accessLogSnapshot() : [],
       config: {
         transport: config.transport,
         targetDeviceId: config.targetDeviceId,
@@ -316,6 +326,14 @@ export function createRuntime({ config, logger }) {
       return () => listeners.delete(listener)
     },
     broadcast,
+
+    /**
+     * 挂载面板实例：快照里的访问探针（panelAccess）由它提供。
+     * 面板是可选部件（没有 webServer 就不挂），所以走挂载而不是构造参数。
+     */
+    attachPanel(panel) {
+      panelRef = panel
+    },
 
     /**
      * 注入宿主上下文。
@@ -347,8 +365,7 @@ export function createRuntime({ config, logger }) {
       }
     },
 
-    /** 扫描并连接（面板「扫描并连接」按钮与自动连接都走这里）。 */
-    async connect() {
+    /** 扫描并连接（面板「扫描并连接」按钮与自动连接都走这里）。 */    async connect() {
       if (link.state === 'connected') return { state: link.state }
       try {
         await link.start()
@@ -434,6 +451,24 @@ export function createRuntime({ config, logger }) {
           await voice.prepare()
           return { message: '已开始准备识别模型', state: snapshot() }
 
+        /**
+         * 运行期改录音上限（面板上的下拉）。
+         *
+         * 为什么需要它：插件的配置表单由 DSH 的设置界面渲染，而表单依赖
+         * `@deepseek-ai/schemastery`；本插件用 junction/软链装进 profile 时 Node 按
+         * 真实路径向上找不到它（它只在 DSH 自己的 app.asar 里），于是插件导出不了
+         * Config，设置界面里就没有任何可改项 —— 用户"找不到地方设置"。
+         * 这里给一个不依赖宿主 schema 的入口：改内存配置 → 立刻把新上限下发给设备。
+         * 需要**持久**（重启仍生效）时改 profile 的 cordis.patch.yml（见 README）。
+         */
+        case 'voice.setMaxSeconds': {
+          const seconds = nearestVoiceMaxSeconds(payload?.seconds)
+          config.voice.maxSeconds = seconds
+          await voice.pushConfig()
+          return { message: `录音上限已设为 ${seconds} 秒`, state: snapshot() }
+        }
+
+
         // 识别结果卡的消费链（docs/06 §2）：挂件先 take 认领（多窗口先到先得），
         // 执行完 ack 回执；take 与 ack 都是幂等的，重复调用只回"已处理过"。
         // 返回值约定与其它动作一致（路由统一包一层 {ok:true, result}）。
@@ -483,9 +518,11 @@ export function createRuntime({ config, logger }) {
 
   // 链路握手完成 → 补推一次状态（去重记忆要清掉，否则"状态没变"就永远不推），
   // 并顺手刷一次余额，让面板与设备都有数据。
+  // 同时下发录音上限：设备只存内存态，断电重连后必须重新告知。
   link.on('ready', () => {
     state.onLinkReady()
     void balance.refresh().catch(() => {})
+    void voice.pushConfig().catch(() => {})
   })
 
   return runtime

@@ -42,7 +42,7 @@ function makeDomain({ voice = {}, speechToText } = {}) {
         fallbackPrompt: true,
         providerId: '',
         language: 'zh',
-        maxSeconds: 15,
+        maxSeconds: 60,
         ...voice,
       },
     },

@@ -377,6 +377,14 @@ test('面板动作分发：全部动作都能被识别，未知动作明确报�
   await dispatch('device.toast', { text: '测试' })
   await dispatch('device.refresh', {})
   await dispatch('balance.refresh', {})
+
+  // 运行期改录音上限（面板下拉的后端动作）：写进配置快照，坏值吸附到档位
+  const cap = await dispatch('voice.setMaxSeconds', { seconds: 120 })
+  assert.equal(cap.message, '录音上限已设为 120 秒')
+  assert.equal(cap.state.config.voice.maxSeconds, 120, '新上限应出现在快照里')
+  const capped = await dispatch('voice.setMaxSeconds', { seconds: 9999 })
+  assert.equal(capped.state.config.voice.maxSeconds, 360, '超过协议天花板应吸附到 360')
+
   await assert.rejects(() => dispatch('nope.nope', {}), /未知的面板动作/)
   await teardown({ runtime })
 })
@@ -394,8 +402,24 @@ test('配置归一化：越界与非法值被钳制，不抛错', () => {
   assert.equal(config.mtuPayload, 512, 'MTU 上限 512')
   assert.equal(config.tasks.maxItems, 50, '任务数上限 50')
   assert.equal(config.approval.timeoutMs, 5000, '审批超时下限 5 秒')
-  assert.equal(config.voice.maxSeconds, 1, '录音时长下限 1 秒')
+  // 录音上限是离散档位：越界/非法值吸附到最近的合法档位，绝不抛错
+  assert.equal(config.voice.maxSeconds, 60, '录音上限最小值 60 秒（-5 吸附到 60）')
   assert.equal(config.logLevel, 'info')
+})
+
+test('配置归一化：录音上限支持 60 / 120 / 360 三档，越界吸附且不超协议天花板', () => {
+  const pick = (value) => normalizeConfig({ voice: { maxSeconds: value } }).voice.maxSeconds
+
+  assert.equal(pick(60), 60)
+  assert.equal(pick(120), 120)
+  assert.equal(pick(360), 360)
+  assert.equal(pick(9999), 360, '不得超过协议硬上限 360 秒')
+  assert.equal(pick(0), 60, '0 吸附到最小档')
+  assert.equal(pick('120'), 120, '字符串数字也要认')
+  assert.equal(pick(undefined), 60, '缺省即默认 60 秒')
+  assert.equal(pick('abc'), 60, '非数字退回默认，不抛错')
+  // 空配置的默认值
+  assert.equal(normalizeConfig({}).voice.maxSeconds, 60)
 })
 
 test('协议：设备请求余额会拿到数据并通过 reply 回给设备', async () => {
@@ -404,6 +428,16 @@ test('协议：设备请求余额会拿到数据并通过 reply 回给设备', a
   const balance = replies.find((message) => message.type === MSG.BALANCE)
   assert.ok(balance, '宿主应把余额回给设备')
   assert.equal(balance.totalBalance, 42.5)
+  await teardown({ runtime })
+})
+
+test('★ 接线：链路握手完成时自动把录音上限下发给设备', async () => {
+  // 设备端只保存内存态上限（不写 NVS），所以每次就绪都必须重发 ——
+  // 这条测的是 link.on('ready') 上的接线，漏了它设备会一直用固件默认值。
+  const { runtime } = await setupRuntime({}, { voice: { maxSeconds: 120 } })
+  const configMsg = sentByHost(runtime).find((message) => message.type === MSG.CONFIG)
+  assert.ok(configMsg, `应当下发 config 消息，实际发出：${sentByHost(runtime).map((m) => m.type).join(',')}`)
+  assert.equal(configMsg.maxRecordSeconds, 120)
   await teardown({ runtime })
 })
 
