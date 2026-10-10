@@ -88,11 +88,32 @@ http://127.0.0.1:19387/dsh-passport
 | --- | --- | --- |
 | `transport` | `bridge` | `bridge`（子进程）/ `mock`（无硬件联调）/ `noble`（进程内） |
 | `autoConnect` | `true` | 插件加载后自动扫描连接 |
+| `voice.maxSeconds` | `60` | 单次录音上限（秒），可选 `60` / `120` / `360`；由插件通过 `config` 消息下发给设备 |
 | `tasks.maskTitles` | `false` | 设备上只显示"任务 xxxx"，适合公共场合 |
-| `voice.autoSend` | `false` | 识别完直接下发，省掉设备上再按一次确定 |
+| `voice.directSend` | `true` | 设备识别结果卡双击直发（整段替换草稿并提交） |
 
 完整配置表与语音识别（SenseVoice 本地模型）启用方式见
 [docs/03-构建与烧录.md](docs/03-构建与烧录.md) 与 [docs/04-桌面客户端集成.md](docs/04-桌面客户端集成.md)。
+
+### 在哪里改配置（含录音上限）
+
+1. **控制面板（即时，推荐试值）**：`http://127.0.0.1:19387/dsh-passport` →「设备」卡片 →
+   「录音上限」下拉（60 / 120 / 360）→「应用」。改动立即生效并下发给设备，
+   但**不写回配置文件**（重启后回到配置里的值）。需要宿主插件已加载该动作，故改完要重启一次 DSH。
+2. **持久**：在 DSH profile 的 `cordis.patch.yml` 里按 id 覆盖，例如
+   ```yaml
+   - id: dsh-ai-passport
+     name: dsh-ai-passport
+     config:
+       voice: { maxSeconds: 120 }
+   ```
+   重启 DSH 生效。
+
+> **为什么 DSH 设置界面里没有表单项**：插件的配置表单依赖宿主提供的
+> `@deepseek-ai/schemastery`。插件用链接（junction/symlink）方式装进 profile 时，
+> Node 按真实路径向上解析，找不到该包（它只在 DSH 自己的 `app.asar` 内），
+> 于是插件导出不了 `Config`（日志表现为 `module evaluated Config=none`），
+> 设置界面自然没有任何可改项。上面两条入口都不依赖宿主 schema。
 
 ## 版本与兼容性
 
