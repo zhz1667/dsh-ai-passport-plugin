@@ -74,10 +74,11 @@ test('追问瀑布：设备收到 question.req，提交后答案交回 ask()', a
     () => { cardStarted = true; return new Promise(() => {}) },
   )
 
-  // 设备端应当收到第 1 题
-  await new Promise((resolve) => setTimeout(resolve, 20))
-  const req = sentByHost(runtime).find((m) => m.type === MSG.QUESTION_REQ)
-  assert.ok(req, '设备应收到 question.req')
+  // 设备端应当收到第 1 题。
+  // ★ 这里不能睡固定时长：链路发送是异步的，实测这条消息约 45ms 才落地，
+  //   睡 20ms 会跑在投递前面 —— 该断言因此随机失败（连跑 4 次挂 3 次）。
+  //   用本文件已有的 waitForSent 轮询，条件成立立刻返回。
+  const req = await waitForSent(runtime, MSG.QUESTION_REQ)
   assert.equal(req.callId, 'call-42')
 
   // 模拟设备作答：单选选中 + 提交
