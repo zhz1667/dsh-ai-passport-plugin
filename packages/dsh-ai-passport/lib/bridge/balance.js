@@ -44,6 +44,10 @@ export class BalanceDomain {
   registerProtocolHandlers() {
     this.disposers.push(
       this.link.onMessage(MSG.BALANCE_REQ, async (_message, context) => {
+        // 设备端"长按下键"才会走到这里。真机上"按了没反应"分两种：请求根本没上来，
+        // 还是上来了但设备没显示——设备端的按键/READY 状态在主机侧看不见，
+        // 这条日志就是切开这两种情况的凭证，所以留在 info 级（触发频率很低）。
+        this.logger('info', '[balance] 设备请求余额（设备端长按下键）')
         try {
           const balance = await this.refresh({ force: true })
           await context.reply(MSG.BALANCE, balance)

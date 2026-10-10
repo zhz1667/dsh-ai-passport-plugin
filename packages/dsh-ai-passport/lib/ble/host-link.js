@@ -470,7 +470,14 @@ export class HostLink extends EventEmitter {
 
     const message = decodeJson(result.payload)
     if (!message || typeof message !== 'object' || typeof message.type !== 'string') {
-      this.logger('debug', `[link] 无法解析的消息：${hexPreview(result.payload)}`)
+      // ★ 用 warn 而不是 debug：这类"对端发了、我们解不开"的帧过去只写 debug，
+      //   结果设备 hello 被截断成坏 JSON 时，面板三项全显示"—"，宿主侧却毫无痕迹
+      //   （真实事故：设备帧缓冲 160 字节装不下带 -dirty 的版本号，尾部 "97}" 被截掉）。
+      //   带上长度与前 48 字节预览，下次能一眼定位。
+      this.logger(
+        'warn',
+        `[link] 无法解析的消息（${result.payload?.length ?? 0} 字节，已丢弃）：${hexPreview(result.payload)}`,
+      )
       return
     }
 
@@ -516,6 +523,16 @@ export class HostLink extends EventEmitter {
         // 设备确认主机已就绪 → 握手闭环完成。业务域可以在此之后开始推送状态，
         // 提前推送会因为设备端还没建好界面而丢失。
         this.handshakeComplete = true
+        // 诊断：设备信息只由设备**主动**发的那条 hello 带来，与这条 hello.ack
+        // 是两条独立路径。所以会出现"握手成功、面板三项全空"。固件 1.1.0 之前的
+        // 版本每条连接只发一次 hello（错过不补发），这里明确告警而不是静默。
+        if (!this.deviceInfo) {
+          this.logger(
+            'warn',
+            '[link] 握手完成但未收到设备 hello：固件版本/协议版本/电量将显示为"—"。' +
+              '设备重连或重启后会重新握手。',
+          )
+        }
         this.emit('ready', { deviceInfo: this.deviceInfo, host: message })
         break
       default:

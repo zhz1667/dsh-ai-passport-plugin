@@ -21,6 +21,22 @@ const PANEL_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'stati
 /** 只读接口不需要回环限制（局域网里也能看状态），写接口必须回环。 */
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
+/**
+ * 访问探针关注的路径：页面文档、静态资源、事件流。
+ * 这些每次加载只请求一次，不会被 2 秒一次的状态轮询冲掉。
+ *
+ * 为什么需要它：真机上出现过"内嵌浏览器打开了页签却是空白，同一个地址在外部浏览器
+ * 却正常"。这时唯一能分清"请求根本没到面板"还是"到了但被栅栏拒了/资源没拿到"的，
+ * 就是这份探针记录 —— 猜是猜不出来的。
+ */
+const PROBE_PATHS = new Set([
+  '/dsh-passport',
+  '/dsh-passport/index.html',
+  '/dsh-passport/panel.js',
+  '/dsh-passport/panel.css',
+  '/dsh-passport/events',
+])
+
 export class Panel {
   /**
    * @param {object} options
@@ -38,6 +54,11 @@ export class Panel {
     this.logger = options.logger ?? (() => {})
     /** @type {Set<import('node:http').ServerResponse>} */
     this.sseClients = new Set()
+    /**
+     * 访问探针环形缓冲（最近 12 条，见 PROBE_PATHS）。
+     * @type {Array<object>}
+     */
+    this.accessLog = []
     this.unsubscribe = null
     this.trustedAuthorities = String(process.env.DSH_PASSPORT_TRUSTED_HOSTS ?? '')
       .split(',')
@@ -60,7 +81,34 @@ export class Panel {
           path: routePath,
           handler: async (req, res) => {
             const rejection = this.#rejection(req)
+            // 探针：被拒请求 + 页面加载相关的路径（文档/资源/SSE）。
+            // 状态轮询刻意不记——每 2 秒一次，记了会把有效线索立刻冲掉。
+            if (rejection || PROBE_PATHS.has(routePath)) {
+              this.#recordAccess({
+                at: new Date().toISOString(),
+                path: routePath,
+                status: rejection ?? 200,
+                host: String(req.headers.host ?? ''),
+                origin: String(req.headers.origin ?? ''),
+                site: String(req.headers['sec-fetch-site'] ?? ''),
+                mode: String(req.headers['sec-fetch-mode'] ?? ''),
+                dest: String(req.headers['sec-fetch-dest'] ?? ''),
+                ua: String(req.headers['user-agent'] ?? '').slice(0, 90),
+              })
+            }
             if (rejection) {
+              // ★ 被拒时必须留痕。曾经整整一轮排查卡在"面板打不开、日志里却什么都没有"——
+              //   因为这里当初只回 403 不写日志，"谁带着什么头被挡在门外"完全不可见。
+              //   嵌入式浏览器（DSH 桌面端右侧栏/访客视图）与挂件的 fetch 都走这条路，
+              //   Host / Origin / Sec-Fetch-* / UA 是定位这类问题的唯一线索。
+              this.logger(
+                'warn',
+                `[panel] 拒绝 ${req.method} ${req.url} → HTTP ${rejection}` +
+                `（Host=${req.headers.host ?? '-'} Origin=${req.headers.origin ?? '-'}` +
+                ` Sec-Fetch-Site=${req.headers['sec-fetch-site'] ?? '-'}` +
+                ` Sec-Fetch-Mode=${req.headers['sec-fetch-mode'] ?? '-'}` +
+                ` UA=${String(req.headers['user-agent'] ?? '-').slice(0, 70)}）`,
+              )
               this.#sendJson(res, rejection, { ok: false, error: 'forbidden', message: '请求未被信任' })
               return
             }
@@ -112,6 +160,23 @@ export class Panel {
   start() {
     if (this.unsubscribe) return
     this.unsubscribe = this.subscribe((event) => this.broadcast(event))
+  }
+
+  /**
+   * 记录一条访问探针（环形缓冲，最近 12 条）。
+   * @param {object} entry 已裁剪好的记录项
+   */
+  #recordAccess(entry) {
+    this.accessLog.push(entry)
+    if (this.accessLog.length > 12) this.accessLog.shift()
+  }
+
+  /**
+   * 探针快照，供 state.json 暴露给排障用。
+   * @returns {Array<object>} 最近的面板访问记录（副本）
+   */
+  accessLogSnapshot() {
+    return this.accessLog.map((entry) => ({ ...entry }))
   }
 
   /** 向所有面板推送一个事件。 */
