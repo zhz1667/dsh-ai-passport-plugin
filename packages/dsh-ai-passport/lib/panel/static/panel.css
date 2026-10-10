@@ -130,6 +130,8 @@ body {
   padding: 0 7px;
 }
 .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.pair-box { margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+.pair-input { flex: 1; min-width: 120px; padding: 6px 8px; font-size: 16px; letter-spacing: 4px; font-family: ui-monospace, Menlo, monospace; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
 .hint { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
 
 /* —— 键值表 —— */

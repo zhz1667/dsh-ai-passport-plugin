@@ -28,11 +28,28 @@
     <section class="card" id="card-device">
       <h2>设备</h2>
       <dl class="kv" id="device-info"><dt>状态</dt><dd>—</dd></dl>
+      <div id="pair-box" class="pair-box hidden">
+        <p class="hint">设备屏幕上显示了 6 位配对码，请输入：</p>
+        <div class="row">
+          <input id="pair-code" class="pair-input" type="text" inputmode="numeric" maxlength="6" placeholder="6 位数字" autocomplete="off">
+          <button id="btn-pair" class="btn small">配对</button>
+        </div>
+      </div>
       <div class="row">
         <button class="btn small" data-action="device.ping">测试心跳</button>
         <button class="btn small" data-action="device.toast" data-payload='{"text":"来自控制面板的测试提示"}'>发送测试提示</button>
         <button class="btn small" data-action="device.refresh">刷新任务列表</button>
       </div>
+      <div class="row" id="voice-cap-row">
+        <label class="hint" for="max-seconds" style="margin:0;align-self:center">录音上限</label>
+        <select id="max-seconds" class="pair-input" style="flex:0 0 110px;letter-spacing:0">
+          <option value="60">60 秒</option>
+          <option value="120">120 秒</option>
+          <option value="360">360 秒</option>
+        </select>
+        <button id="btn-apply-cap" class="btn small">应用</button>
+      </div>
+      <p class="hint" id="cap-hint">改这里立即生效并下发给设备；重启后要保留，请写进 profile 的 cordis.patch.yml。</p>
       <details class="diag">
         <summary>链路诊断</summary>
         <pre id="link-stats">—</pre>

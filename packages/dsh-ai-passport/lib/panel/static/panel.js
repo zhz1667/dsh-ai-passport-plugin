@@ -98,6 +98,11 @@ function applyState(state) {
   els.disconnect.disabled = transportState !== 'connected'
 
   renderDevice(link)
+  document.getElementById('pair-box').classList.toggle('hidden', !state.pairing?.needed || state.pairing?.paired)
+  // 录音上限下拉跟随当前生效值（它可能来自配置，也可能是本次运行期改过的）
+  const capSelect = document.getElementById('max-seconds')
+  const cap = String(state.config?.voice?.maxSeconds ?? '')
+  if (cap && capSelect.value !== cap) capSelect.value = cap
   renderTasks(state.tasks ?? [])
   renderApprovals(state.approvals ?? [])
   renderBalance(state.balance, state.balanceError)
@@ -337,8 +342,21 @@ document.addEventListener('click', (event) => {
   void act(button.dataset.action, payload)
 })
 
+document.getElementById('btn-pair').addEventListener('click', () => {
+  const code = document.getElementById('pair-code').value.replace(/\D/g, '')
+  if (code.length !== 6) {
+    showBanner('请输入 6 位数字配对码', 'error')
+    return
+  }
+  void act('pair.submit', { code })
+})
+
 els.connect.addEventListener('click', () => act('device.connect'))
 els.disconnect.addEventListener('click', () => act('device.disconnect'))
+document.getElementById('btn-apply-cap').addEventListener('click', () => {
+  const seconds = Number(document.getElementById('max-seconds').value)
+  void act('voice.setMaxSeconds', { seconds })
+})
 document.getElementById('btn-clear-events').addEventListener('click', () => els.eventLog.replaceChildren())
 
 // —— 启动 ——
